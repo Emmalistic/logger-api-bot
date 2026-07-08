@@ -7,6 +7,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import os
 import logging
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -14,31 +15,56 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 if not DATABASE_URL:
-    raise ValueError(
+    error_msg = (
         "❌ DATABASE_URL environment variable is not set!\n"
         "Please add it in Render dashboard: Environment → DATABASE_URL"
     )
+    logger.error(error_msg)
+    # Don't raise error in production, use fallback
+    logger.warning("⚠️ Using fallback SQLite database")
+    DATABASE_URL = "sqlite:///discord_logs.db"
 
 # Convert postgres:// to postgresql:// for SQLAlchemy
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
-# Create engine with PostgreSQL-optimized settings
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,  # Check connection before using
-    pool_recycle=300,    # Recycle connections every 5 minutes
-    pool_size=5,         # Maintain 5 connections in pool
-    max_overflow=10,     # Allow 10 extra connections if needed
-    connect_args={
-        "connect_timeout": 10,
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-    }
-)
+# Create engine based on database type
+try:
+    if DATABASE_URL.startswith('sqlite'):
+        engine = create_engine(
+            DATABASE_URL,
+            echo=False,
+            connect_args={"check_same_thread": False}
+        )
+        logger.info("✅ Using SQLite database")
+    else:
+        # PostgreSQL (Neon)
+        engine = create_engine(
+            DATABASE_URL,
+            echo=False,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            pool_size=5,
+            max_overflow=10,
+            connect_args={
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
+            }
+        )
+        logger.info("✅ Using Neon PostgreSQL database")
+except Exception as e:
+    logger.error(f"❌ Failed to create database engine: {e}")
+    # Use SQLite as fallback
+    logger.warning("⚠️ Falling back to SQLite database")
+    DATABASE_URL = "sqlite:///discord_logs.db"
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args={"check_same_thread": False}
+    )
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -64,8 +90,8 @@ class Message(Base):
     edited_timestamp = Column(DateTime, nullable=True)
     is_bot = Column(Boolean, default=False)
     is_system = Column(Boolean, default=False)
-    mentions = Column(Text, nullable=True)  # JSON string
-    mentioned_roles = Column(Text, nullable=True)  # JSON string
+    mentions = Column(Text, nullable=True)
+    mentioned_roles = Column(Text, nullable=True)
     has_attachments = Column(Boolean, default=False)
     has_embed = Column(Boolean, default=False)
     has_reactions = Column(Boolean, default=False)
@@ -80,7 +106,6 @@ class Message(Base):
     )
 
     def to_dict(self):
-        """Convert message to dictionary for JSON response"""
         return {
             'id': self.id,
             'message_id': self.message_id,
@@ -200,7 +225,7 @@ def init_db():
         return True
     except Exception as e:
         logger.error(f"❌ Failed to create tables: {e}")
-        raise
+        return False
 
 
 def get_db():
@@ -217,6 +242,6 @@ def close_db(db):
 # Test connection on module load
 try:
     with engine.connect() as conn:
-        logger.info("✅ Successfully connected to Neon PostgreSQL")
+        logger.info("✅ Database connection successful")
 except Exception as e:
-    logger.error(f"❌ Failed to connect to Neon: {e}")
+    logger.error(f"❌ Database connection failed: {e}")
