@@ -25,11 +25,10 @@ logger = logging.getLogger(__name__)
 # Check for required environment variables
 if not os.environ.get('DISCORD_TOKEN'):
     logger.error("❌ DISCORD_TOKEN not found! Please add it to Render environment variables.")
-    sys.exit(1)
+    # Don't exit, let it try to run anyway
 
 if not os.environ.get('DATABASE_URL'):
-    logger.error("❌ DATABASE_URL not found! Please add your Neon connection string.")
-    sys.exit(1)
+    logger.warning("⚠️ DATABASE_URL not found! Using SQLite fallback.")
 
 # Flask app for health checks
 app = Flask(__name__)
@@ -39,8 +38,9 @@ def index():
     return jsonify({
         'service': 'Discord Logger Bot',
         'status': 'running',
-        'database': 'Neon PostgreSQL',
-        'version': '1.0.0'
+        'database': 'Neon PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite (fallback)',
+        'version': '1.0.0',
+        'python_version': sys.version.split()[0]
     })
 
 @app.route('/health')
@@ -48,32 +48,51 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'Discord Bot',
-        'database': 'Neon PostgreSQL',
+        'database': 'Neon PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite (fallback)',
         'timestamp': datetime.utcnow().isoformat()
     })
 
 def run_web_server():
     """Run Flask web server for health checks"""
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"❌ Web server error: {e}")
 
 
 class MessageLoggerBot(discord.Client):
-    """Discord bot that logs all messages to Neon PostgreSQL"""
+    """Discord bot that logs all messages to database"""
 
     def __init__(self):
+        # Enable required intents
         intents = Intents.default()
         intents.message_content = True
         intents.messages = True
         intents.guilds = True
         intents.members = True
         intents.reactions = True
+        
         super().__init__(intents=intents)
+        self.db_initialized = False
 
     async def on_ready(self):
         """Called when bot is ready"""
+        try:
+            # Initialize database
+            if not self.db_initialized:
+                success = init_db()
+                self.db_initialized = True
+                if success:
+                    logger.info('✅ Database initialized successfully')
+                else:
+                    logger.warning('⚠️ Database initialization failed, continuing anyway')
+        except Exception as e:
+            logger.error(f'❌ Database init error: {e}')
+        
         logger.info(f'✅ Bot logged in as {self.user} (ID: {self.user.id})')
         logger.info(f'📊 Connected to {len(self.guilds)} servers')
+        logger.info(f'🐍 Python version: {sys.version.split()[0]}')
         logger.info('🚀 Bot is ready and listening for messages!')
 
     async def on_message(self, message):
@@ -82,6 +101,10 @@ class MessageLoggerBot(discord.Client):
         if message.author.bot:
             return
         if message.type != discord.MessageType.default:
+            return
+
+        if not self.db_initialized:
+            logger.warning("⚠️ Database not initialized, skipping message log")
             return
 
         db = get_db()
@@ -142,6 +165,9 @@ class MessageLoggerBot(discord.Client):
         if after.type != discord.MessageType.default:
             return
 
+        if not self.db_initialized:
+            return
+
         db = get_db()
         try:
             msg_record = db.query(Message).filter_by(message_id=str(after.id)).first()
@@ -168,6 +194,9 @@ class MessageLoggerBot(discord.Client):
     async def on_message_delete(self, message):
         """Called when a message is deleted"""
         if message.type != discord.MessageType.default:
+            return
+
+        if not self.db_initialized:
             return
 
         db = get_db()
@@ -206,19 +235,21 @@ class MessageLoggerBot(discord.Client):
 def run_bot():
     """Run the Discord bot"""
     try:
-        # Initialize database
-        init_db()
-        logger.info('✅ Database initialized with Neon PostgreSQL')
-
         # Start web server in background thread
         web_thread = threading.Thread(target=run_web_server, daemon=True)
         web_thread.start()
-        logger.info('✅ Web server started on port ' + os.environ.get('PORT', '10000'))
+        logger.info(f'✅ Web server started on port {os.environ.get("PORT", "10000")}')
 
         # Run Discord bot
         bot = MessageLoggerBot()
         logger.info('🚀 Starting Discord bot...')
-        bot.run(os.environ.get('DISCORD_TOKEN'))
+        
+        token = os.environ.get('DISCORD_TOKEN')
+        if not token:
+            logger.error('❌ DISCORD_TOKEN not set!')
+            return
+        
+        bot.run(token)
 
     except discord.LoginFailure:
         logger.error('❌ Invalid Discord token! Please check your DISCORD_TOKEN.')
