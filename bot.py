@@ -1,5 +1,6 @@
 """
-Discord Bot - Message Logger with Neon PostgreSQL
+Discord Bot - Simple Logger
+Just logs messages, edits, deletions, and attachments
 """
 
 import discord
@@ -22,98 +23,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Check for required environment variables
-if not os.environ.get('DISCORD_TOKEN'):
-    logger.error("❌ DISCORD_TOKEN not found! Please add it to Render environment variables.")
-    # Don't exit, let it try to run anyway
-
-if not os.environ.get('DATABASE_URL'):
-    logger.warning("⚠️ DATABASE_URL not found! Using SQLite fallback.")
-
 # Flask app for health checks
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return jsonify({
-        'service': 'Discord Logger Bot',
-        'status': 'running',
-        'database': 'Neon PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite (fallback)',
-        'version': '1.0.0',
-        'python_version': sys.version.split()[0]
-    })
-
 @app.route('/health')
 def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'service': 'Discord Bot',
-        'database': 'Neon PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite (fallback)',
-        'timestamp': datetime.utcnow().isoformat()
-    })
+    return jsonify({'status': 'healthy', 'service': 'Discord Bot'})
+
+@app.route('/')
+def index():
+    return jsonify({'service': 'Discord Bot', 'status': 'running'})
 
 def run_web_server():
-    """Run Flask web server for health checks"""
     port = int(os.environ.get('PORT', 10000))
-    try:
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-    except Exception as e:
-        logger.error(f"❌ Web server error: {e}")
-
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 class MessageLoggerBot(discord.Client):
-    """Discord bot that logs all messages to database"""
-
     def __init__(self):
-        # Enable required intents
         intents = Intents.default()
         intents.message_content = True
         intents.messages = True
         intents.guilds = True
         intents.members = True
         intents.reactions = True
-        
         super().__init__(intents=intents)
-        self.db_initialized = False
 
     async def on_ready(self):
-        """Called when bot is ready"""
-        try:
-            # Initialize database
-            if not self.db_initialized:
-                success = init_db()
-                self.db_initialized = True
-                if success:
-                    logger.info('✅ Database initialized successfully')
-                else:
-                    logger.warning('⚠️ Database initialization failed, continuing anyway')
-        except Exception as e:
-            logger.error(f'❌ Database init error: {e}')
-        
-        logger.info(f'✅ Bot logged in as {self.user} (ID: {self.user.id})')
+        logger.info(f'✅ Bot logged in as {self.user}')
         logger.info(f'📊 Connected to {len(self.guilds)} servers')
-        logger.info(f'🐍 Python version: {sys.version.split()[0]}')
-        logger.info('🚀 Bot is ready and listening for messages!')
+        logger.info('🚀 Bot is ready!')
 
     async def on_message(self, message):
-        """Called when a message is sent"""
-        # Ignore bot messages and system messages
         if message.author.bot:
             return
         if message.type != discord.MessageType.default:
             return
 
-        if not self.db_initialized:
-            logger.warning("⚠️ Database not initialized, skipping message log")
-            return
-
         db = get_db()
         try:
-            # Extract mentions
             mentioned_users = [str(m.id) for m in message.mentions]
             mentioned_roles = [str(r.id) for r in message.role_mentions]
 
-            # Create message record
             msg_record = Message(
                 message_id=str(message.id),
                 channel_id=str(message.channel.id),
@@ -132,10 +82,10 @@ class MessageLoggerBot(discord.Client):
                 has_attachments=len(message.attachments) > 0,
                 has_embed=len(message.embeds) > 0,
                 has_reactions=len(message.reactions) > 0,
+                reply_to_message_id=str(message.reference.message_id) if message.reference else None,
             )
             db.add(msg_record)
 
-            # Store attachments
             for attachment in message.attachments:
                 att_record = Attachment(
                     message_id=str(message.id),
@@ -149,23 +99,16 @@ class MessageLoggerBot(discord.Client):
                 db.add(att_record)
 
             db.commit()
-            logger.info(f'📝 Logged message {message.id} from {message.author}')
+            logger.info(f'📝 Logged message {message.id}')
 
         except Exception as e:
-            logger.error(f'❌ Error logging message: {e}')
-            logger.error(traceback.format_exc())
+            logger.error(f'❌ Error: {e}')
             db.rollback()
         finally:
             close_db(db)
 
     async def on_message_edit(self, before, after):
-        """Called when a message is edited"""
         if before.content == after.content:
-            return
-        if after.type != discord.MessageType.default:
-            return
-
-        if not self.db_initialized:
             return
 
         db = get_db()
@@ -183,22 +126,14 @@ class MessageLoggerBot(discord.Client):
                 )
                 db.add(edit_record)
                 db.commit()
-                logger.info(f'✏️ Logged edit for message {after.id}')
+                logger.info(f'✏️ Edit logged for {after.id}')
         except Exception as e:
-            logger.error(f'❌ Error logging edit: {e}')
-            logger.error(traceback.format_exc())
+            logger.error(f'❌ Error: {e}')
             db.rollback()
         finally:
             close_db(db)
 
     async def on_message_delete(self, message):
-        """Called when a message is deleted"""
-        if message.type != discord.MessageType.default:
-            return
-
-        if not self.db_initialized:
-            return
-
         db = get_db()
         try:
             msg_record = db.query(Message).filter_by(message_id=str(message.id)).first()
@@ -215,6 +150,7 @@ class MessageLoggerBot(discord.Client):
                 content=message.content,
                 original_timestamp=message.created_at,
                 has_attachments=len(message.attachments) > 0,
+                reply_to_message_id=msg_record.reply_to_message_id if msg_record else None
             )
             db.add(deleted_record)
 
@@ -222,43 +158,28 @@ class MessageLoggerBot(discord.Client):
                 msg_record.content = "[MESSAGE DELETED]"
 
             db.commit()
-            logger.info(f'🗑️ Logged deletion of message {message.id}')
-
+            logger.info(f'🗑️ Deletion logged for {message.id}')
         except Exception as e:
-            logger.error(f'❌ Error logging deletion: {e}')
-            logger.error(traceback.format_exc())
+            logger.error(f'❌ Error: {e}')
             db.rollback()
         finally:
             close_db(db)
 
-
 def run_bot():
-    """Run the Discord bot"""
-    try:
-        # Start web server in background thread
-        web_thread = threading.Thread(target=run_web_server, daemon=True)
-        web_thread.start()
-        logger.info(f'✅ Web server started on port {os.environ.get("PORT", "10000")}')
-
-        # Run Discord bot
-        bot = MessageLoggerBot()
-        logger.info('🚀 Starting Discord bot...')
-        
-        token = os.environ.get('DISCORD_TOKEN')
-        if not token:
-            logger.error('❌ DISCORD_TOKEN not set!')
-            return
-        
-        bot.run(token)
-
-    except discord.LoginFailure:
-        logger.error('❌ Invalid Discord token! Please check your DISCORD_TOKEN.')
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f'❌ Bot crashed: {e}')
-        logger.error(traceback.format_exc())
-        sys.exit(1)
-
+    init_db()
+    logger.info('✅ Database initialized')
+    
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logger.info('✅ Web server started')
+    
+    token = os.environ.get('DISCORD_TOKEN')
+    if not token:
+        logger.error('❌ No token!')
+        return
+    
+    bot = MessageLoggerBot()
+    bot.run(token)
 
 if __name__ == '__main__':
     run_bot()
